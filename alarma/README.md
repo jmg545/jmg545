@@ -330,3 +330,86 @@ así que no se sube al repositorio.
   contenido es «10:20», el impacto es nulo.
 - Si aun así quieres cero terceros: usa el modo LAN del Paso 2 (`Endpoint` apuntando al servidor
   HTTP de Tasker), que no sale de tu red — a cambio de que sólo funcione en casa.
+
+---
+
+## Anexo — Cloudflare Worker (opcional)
+
+**Todo lo anterior funciona sin esto.** Es una capa opcional que sólo tiene sentido si ya tienes
+un dominio en Cloudflare.
+
+### Qué hace y qué no
+
+Cloudflare **no puede despertar el Pixel**: un Worker es un servidor, no un canal push. Para
+entregar sin nada corriendo en el móvil hace falta FCM, y empujar por FCM exige una app Android
+con su token registrado — o sea, habría que escribir una app, que es justo lo que ya es ntfy.
+(Cloudflare Pub/Sub, el broker MQTT que habría servido, se retiró en agosto de 2025.)
+
+Así que el Worker **no sustituye a ntfy: se pone delante**.
+
+```
+PC ──HTTPS+Bearer──► alarma.tudominio.com (Worker) ──► ntfy.sh/<topic> ──FCM──► Pixel
+```
+
+| Aporta | No aporta |
+|---|---|
+| Un token con ACL de verdad (el ntfy gratuito no tiene ACL) | Seguridad en el último tramo: si alguien descubre el topic, sigue pudiendo publicar y escuchar |
+| Validación del payload antes de publicar | Menos latencia (suma ~30 ms) |
+| URL propia en vez de un topic aleatorio | Quitar la dependencia de ntfy |
+| El topic y el token de Tasker salen del PC y viven como secretos en Cloudflare | |
+| Cambiar de ntfy a Join mañana = tocar sólo el Worker, no el PC | |
+| Rate limiting y logs de Cloudflare | |
+
+Coste: 0 € (el plan gratuito son 100.000 peticiones/día; usarás unas 5).
+
+### Despliegue (sin instalar nada)
+
+1. Panel de Cloudflare → **Workers & Pages → Create → Worker**. Nómbralo `alarma`.
+2. **Edit code**, pega [`cloudflare/worker.js`](cloudflare/worker.js), **Deploy**.
+3. **Settings → Variables and Secrets**, añade los tres como *Secret*:
+   - `ALARMA_TOKEN` — el que enviará el PC (un GUID)
+   - `NTFY_TOPIC` — el nombre del topic, sin la URL
+   - `TASKER_TOKEN` — el que verifica Tasker en el paso 2 de la tarea
+4. **Settings → Domains & Routes → Add → Custom domain**: `alarma.tudominio.com`.
+5. Opcional: *Security → WAF → Rate limiting rules*, 10 peticiones/minuto por IP.
+
+### Cambio en Windows
+
+Ninguno en el código. Sólo `alarma.config.ps1`:
+
+```powershell
+@{
+    Endpoint   = 'https://alarma.tudominio.com'
+    Token      = ''                                  # ahora lo inyecta el Worker
+    AuthHeader = 'Bearer <el valor de ALARMA_TOKEN>'
+}
+```
+
+En Tasker no cambia nada: sigue llegando el mismo JSON con el mismo `token`.
+
+### Verificado
+
+Ejecutadas contra el Worker con un `fetch` simulado:
+
+```
+ok 10:20 mañana      -> 200 ok                ntfy <- {"token":"secreto-tasker","hour":10,"minute":20,"date":"2026-08-12"}
+token PC erroneo     -> 401 Unauthorized      no se publica nada
+sin Authorization    -> 401 Unauthorized      no se publica nada
+GET                  -> 405 Method Not Allowed no se publica nada
+json roto            -> 400 JSON invalido     no se publica nada
+hour 25              -> 400 hour invalido     no se publica nada
+minute 90            -> 400 minute invalido   no se publica nada
+hour como texto      -> 400 hour invalido     no se publica nada
+fecha mal            -> 400 date invalido     no se publica nada
+```
+
+Nótese la primera línea: el `token` que manda el PC se descarta y el Worker inyecta el suyo.
+
+### Lo que descarté de Cloudflare
+
+- **Cloudflare Tunnel al servidor HTTP de Tasker**: te daría acceso al Pixel desde fuera de casa
+  sin ntfy, pero exige `cloudflared` corriendo permanentemente en el móvil (vía Termux). Viola
+  el requisito de «sin procesos residentes» y gasta batería.
+- **Worker + KV con Tasker haciendo polling**: elimina el push, pero a cambio de latencia de
+  minutos y consulta periódica constante. Para una alarma que pones «para dentro de 20 minutos»
+  no sirve.
