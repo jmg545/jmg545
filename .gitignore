@@ -1,0 +1,2 @@
+# Configuracion local: contiene el endpoint y el token. No subir nunca.
+alarma/alarma.config.ps1
